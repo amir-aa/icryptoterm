@@ -86,8 +86,11 @@ Encrypted files have the following structure:
 - if you need to use your own key ensure the key is properly base64 encoded and length is 32Bytes
 
 # Author/Developer
-This application is written by [a Amir Ahmadabadiha](https://linkedin.com/in/amir-ahmadabadiha-259113175) the Founder of [a Filesaver](https://filesaver.ir/) Platform
-Contact Mail | Bug Report:  
+This application is written by [a Amir Ahmadabadiha](https://linkedin.com/in/amir-ahmadabadiha-259113175) 
+
+the Founder of [a Filesaver](https://filesaver.ir/) Platform
+
+Contact Mail | Bug Report:  report@filesaver.ir
 ## License
 This project is licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html).  
 See the [LICENSE](./LICENSE) file for details.
