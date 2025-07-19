@@ -17,7 +17,7 @@ from Crypto.Util.Padding import pad, unpad
 
 
 try:
-    from RC6Encryption import RC6Encryption
+ 
     RC6_AVAILABLE = True
 except ImportError:
     RC6_AVAILABLE = False
@@ -179,27 +179,160 @@ class AESCipher(CipherBase):
             return unpad(padded_plaintext, self.block_size)
         return padded_plaintext
 
-
-class RC6Cipher(CipherBase):
-    """RC6 cipher implementation using RC6Encryption library."""
+class RC6Cipher:
+    """Pure Python implementation of RC6 cipher"""
     
     def __init__(self, key: bytes):
-        if not RC6_AVAILABLE:
-            raise RuntimeError("RC6Encryption module not available")
-        super().__init__(key)
-        # RC6Encryption expects key as hex string
-        self.rc6_key = key.hex()
+        if len(key) not in [16, 24, 32]:
+            raise ValueError("Key must be 16, 24, or 32 bytes")
+        
+        self.key = key
+        self.rounds = 20
+        self.word_size = 32  # 32-bit words
+        self.block_size = 16  # 16-byte blocks
+        self.key_schedule = self._expand_key()
+    
+    def _expand_key(self):
+        """Key expansion algorithm for RC6"""
+        # Magic constants from original RC6 paper
+        P = 0xB7E15163
+        Q = 0x9E3779B9
+        
+        # Convert key to words
+        key_len = len(self.key)
+        words = [0] * ((key_len + 3) // 4)
+        
+        for i in range(key_len):
+            words[i // 4] |= self.key[i] << (8 * (i % 4))
+        
+        # Initialize S array
+        S = [P]
+        for i in range(1, 2 * self.rounds + 4):
+            S.append((S[-1] + Q) & 0xFFFFFFFF)
+        
+        # Mix key material into S array
+        A = B = i = j = 0
+        rounds = 3 * max(len(words), len(S))
+        
+        for _ in range(rounds):
+            A = S[i] = self._rotate_left((S[i] + A + B) & 0xFFFFFFFF, 3)
+            B = words[j] = self._rotate_left((words[j] + A + B) & 0xFFFFFFFF, (A + B) & 0x1F)
+            i = (i + 1) % len(S)
+            j = (j + 1) % len(words)
+        
+        return S
+    
+    def _rotate_left(self, val, n):
+        """32-bit left rotation"""
+        n &= 0x1F  # Limit rotation to 0-31 bits
+        return ((val << n) | (val >> (32 - n))) & 0xFFFFFFFF
+    
+    def _rotate_right(self, val, n):
+        """32-bit right rotation"""
+        n &= 0x1F  # Limit rotation to 0-31 bits
+        return ((val >> n) | (val << (32 - n))) & 0xFFFFFFFF
+    
+    def encrypt_block(self, plaintext: bytes) -> bytes:
+        """Encrypt a single 16-byte block"""
+        if len(plaintext) != self.block_size:
+            raise ValueError(f"Block must be exactly {self.block_size} bytes")
+        
+        # Split into four 32-bit words
+        A = int.from_bytes(plaintext[0:4], 'little')
+        B = int.from_bytes(plaintext[4:8], 'little')
+        C = int.from_bytes(plaintext[8:12], 'little')
+        D = int.from_bytes(plaintext[12:16], 'little')
+        
+        # Initial key mixing
+        B = (B + self.key_schedule[0]) & 0xFFFFFFFF
+        D = (D + self.key_schedule[1]) & 0xFFFFFFFF
+        
+        # Main encryption rounds
+        for i in range(1, self.rounds + 1):
+            t = self._rotate_left((B * (2 * B + 1)) & 0xFFFFFFFF, 5)
+            u = self._rotate_left((D * (2 * D + 1)) & 0xFFFFFFFF, 5)
+            A = (self._rotate_left(A ^ t, u & 0x1F) + self.key_schedule[2 * i]) & 0xFFFFFFFF
+            C = (self._rotate_left(C ^ u, t & 0x1F) + self.key_schedule[2 * i + 1]) & 0xFFFFFFFF
+            
+            # Rotate registers
+            A, B, C, D = B, C, D, A
+        
+        # Final key mixing
+        A = (A + self.key_schedule[2 * self.rounds + 2]) & 0xFFFFFFFF
+        C = (C + self.key_schedule[2 * self.rounds + 3]) & 0xFFFFFFFF
+        
+        # Convert back to bytes
+        return (
+            A.to_bytes(4, 'little') +
+            B.to_bytes(4, 'little') +
+            C.to_bytes(4, 'little') +
+            D.to_bytes(4, 'little')
+        )
+    
+    def decrypt_block(self, ciphertext: bytes) -> bytes:
+        """Decrypt a single 16-byte block"""
+        if len(ciphertext) != self.block_size:
+            raise ValueError(f"Block must be exactly {self.block_size} bytes")
+        
+        # Split into four 32-bit words
+        A = int.from_bytes(ciphertext[0:4], 'little')
+        B = int.from_bytes(ciphertext[4:8], 'little')
+        C = int.from_bytes(ciphertext[8:12], 'little')
+        D = int.from_bytes(ciphertext[12:16], 'little')
+        
+        # Reverse final key mixing
+        C = (C - self.key_schedule[2 * self.rounds + 3]) & 0xFFFFFFFF
+        A = (A - self.key_schedule[2 * self.rounds + 2]) & 0xFFFFFFFF
+        
+        # Main decryption rounds (in reverse)
+        for i in range(self.rounds, 0, -1):
+            # Reverse register rotation
+            A, B, C, D = D, A, B, C
+            
+            u = self._rotate_left((D * (2 * D + 1)) & 0xFFFFFFFF, 5)
+            t = self._rotate_left((B * (2 * B + 1)) & 0xFFFFFFFF, 5)
+            C = self._rotate_right((C - self.key_schedule[2 * i + 1]) & 0xFFFFFFFF, t & 0x1F) ^ u
+            A = self._rotate_right((A - self.key_schedule[2 * i]) & 0xFFFFFFFF, u & 0x1F) ^ t
+        
+        # Reverse initial key mixing
+        D = (D - self.key_schedule[1]) & 0xFFFFFFFF
+        B = (B - self.key_schedule[0]) & 0xFFFFFFFF
+        
+        # Convert back to bytes
+        return (
+            A.to_bytes(4, 'little') +
+            B.to_bytes(4, 'little') +
+            C.to_bytes(4, 'little') +
+            D.to_bytes(4, 'little')
+        )
+
+class RC6CipherCBC(CipherBase):
+    """RC6 implementation with CBC mode support"""
+    
+    def __init__(self, key: bytes):
+        # Initialize the base class
+        self.key = key
+        self.block_size = RC6_BLOCK_SIZE
+        
+        # Create the RC6 cipher instance
+        self.rc6 = RC6Cipher(key)
     
     def get_block_size(self) -> int:
         return RC6_BLOCK_SIZE
     
+    def _get_chunk_iv(self, base_iv: bytes, chunk_index: int) -> bytes:
+        """Generate unique IV for each chunk based on chunk index."""
+        # XOR the base IV with chunk index to ensure unique IVs
+        iv_int = int.from_bytes(base_iv, 'big')
+        iv_int ^= chunk_index
+        return iv_int.to_bytes(len(base_iv), 'big')
+    
     def _xor_bytes(self, a: bytes, b: bytes) -> bytes:
-        """XOR two byte arrays."""
+        """XOR two byte arrays of equal length"""
         return bytes(x ^ y for x, y in zip(a, b))
     
     def _cbc_encrypt(self, data: bytes, iv: bytes) -> bytes:
-        """Implement CBC mode encryption using RC6."""
-        rc6 = RC6Encryption(self.rc6_key)
+        """CBC mode encryption using native RC6"""
         padded_data = pad(data, self.block_size)
         blocks = [padded_data[i:i+self.block_size] 
                  for i in range(0, len(padded_data), self.block_size)]
@@ -208,22 +341,15 @@ class RC6Cipher(CipherBase):
         prev_block = iv
         
         for block in blocks:
-            # XOR with previous ciphertext block (or IV for first block)
             xored = self._xor_bytes(block, prev_block)
-            # Convert to hex for RC6Encryption
-            xored_hex = xored.hex()
-            # Encrypt block
-            encrypted_hex = rc6.encrypt(xored_hex)
-            # Convert back to bytes
-            encrypted_block = bytes.fromhex(encrypted_hex)
-            ciphertext += encrypted_block
-            prev_block = encrypted_block
+            encrypted = self.rc6.encrypt_block(xored)
+            ciphertext += encrypted
+            prev_block = encrypted
         
         return ciphertext
     
     def _cbc_decrypt(self, data: bytes, iv: bytes) -> bytes:
-        """Implement CBC mode decryption using RC6."""
-        rc6 = RC6Encryption(self.rc6_key)
+        """CBC mode decryption using native RC6"""
         blocks = [data[i:i+self.block_size] 
                  for i in range(0, len(data), self.block_size)]
         
@@ -231,33 +357,25 @@ class RC6Cipher(CipherBase):
         prev_block = iv
         
         for block in blocks:
-            # Convert to hex for RC6Encryption
-            block_hex = block.hex()
-            # Decrypt block
-            decrypted_hex = rc6.decrypt(block_hex)
-            # Convert back to bytes
-            decrypted_block = bytes.fromhex(decrypted_hex)
-            # XOR with previous ciphertext block (or IV for first block)
-            xored = self._xor_bytes(decrypted_block, prev_block)
+            decrypted = self.rc6.decrypt_block(block)
+            xored = self._xor_bytes(decrypted, prev_block)
             plaintext += xored
             prev_block = block
         
         return plaintext
     
     def encrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int) -> bytes:
-        """Encrypt chunk using RC6-CBC."""
+        """Encrypt chunk using RC6-CBC"""
         chunk_iv = self._get_chunk_iv(iv, chunk_index)
         return self._cbc_encrypt(chunk, chunk_iv)
     
     def decrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int, is_last: bool = False) -> bytes:
-        """Decrypt chunk using RC6-CBC."""
+        """Decrypt chunk using RC6-CBC"""
         chunk_iv = self._get_chunk_iv(iv, chunk_index)
         plaintext = self._cbc_decrypt(chunk, chunk_iv)
         if is_last:
             return unpad(plaintext, self.block_size)
         return plaintext
-
-
 class CipherFactory:
     """Factory class for creating cipher instances."""
     
@@ -267,7 +385,7 @@ class CipherFactory:
         if algorithm == 'aes':
             return AESCipher(key)
         elif algorithm == 'rc6':
-            return RC6Cipher(key)
+            return RC6CipherCBC(key)
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
 
