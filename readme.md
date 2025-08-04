@@ -84,6 +84,8 @@ Encrypted files have the following structure:
 - Always ensure sufficient disk space for output file
 - Use the same algorithm for decryption as was used for encryption
 - if you need to use your own key ensure the key is properly base64 encoded and length is 32Bytes
+- for encryption and decryption you must use same chunk size unless file would be broken
+- AES strongly recommended for file encryption and RC6 is only available for small files (MAX 100MB)
 
 # Author/Developer
 This application is written by [Amir Ahmadabadiha](https://linkedin.com/in/amir-ahmadabadiha-259113175) 

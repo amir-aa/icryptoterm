@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+Client-side file encryption tool supporting AES and RC6 algorithms.
+Object-oriented approach with file segmentation for large files using CTR mode.
+"""
 
 import os
 import sys
@@ -13,16 +17,7 @@ from dataclasses import dataclass
 import base64
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
-from Crypto.Util.Padding import pad, unpad
-
-
-try:
- 
-    RC6_AVAILABLE = True
-except ImportError:
-    RC6_AVAILABLE = False
-    print("Warning: RC6Encryption not available. Install it with: pip install RC6Encryption")
-
+from Crypto.Util import Counter
 
 # Constants
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large file handling
@@ -31,7 +26,8 @@ RC6_BLOCK_SIZE = 16
 DEFAULT_KEY_SIZE = 32  # 256 bits
 SALT_SIZE = 16
 ITERATION_COUNT = 100000
-METADATA_SIZE = 32  # For storing file metadata
+NONCE_SIZE = 8  # 8 bytes nonce for CTR mode
+COUNTER_SIZE = 8  # 8 bytes counter for CTR mode
 
 
 @dataclass
@@ -39,7 +35,7 @@ class EncryptionMetadata:
     """Metadata for encrypted files."""
     algorithm: str
     salt: bytes
-    iv: bytes
+    nonce: bytes  # Changed from iv to nonce for CTR mode
     original_size: int
     chunk_count: int
     
@@ -49,7 +45,7 @@ class EncryptionMetadata:
         return (
             algo_byte +
             self.salt +
-            self.iv +
+            self.nonce +
             struct.pack('>Q', self.original_size) +
             struct.pack('>I', self.chunk_count)
         )
@@ -59,10 +55,10 @@ class EncryptionMetadata:
         """Deserialize metadata from bytes."""
         algo = 'aes' if data[0:1] == b'A' else 'rc6'
         salt = data[1:17]
-        iv = data[17:33]
-        original_size = struct.unpack('>Q', data[33:41])[0]
-        chunk_count = struct.unpack('>I', data[41:45])[0]
-        return cls(algo, salt, iv, original_size, chunk_count)
+        nonce = data[17:25]  # 8 bytes nonce
+        original_size = struct.unpack('>Q', data[25:33])[0]
+        chunk_count = struct.unpack('>I', data[33:37])[0]
+        return cls(algo, salt, nonce, original_size, chunk_count)
 
 
 class KeyManager:
@@ -75,7 +71,7 @@ class KeyManager:
     
     @staticmethod
     def derive_key_from_password(password: str, salt: bytes, 
-                                key_size: int = DEFAULT_KEY_SIZE) -> bytes:
+                               key_size: int = DEFAULT_KEY_SIZE) -> bytes:
         """Derive a key from password using PBKDF2."""
         return hashlib.pbkdf2_hmac(
             'sha256', 
@@ -140,44 +136,47 @@ class CipherBase(ABC):
         pass
     
     @abstractmethod
-    def encrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int) -> bytes:
-        """Encrypt a single chunk."""
+    def encrypt_chunk(self, chunk: bytes, nonce: bytes, chunk_index: int) -> bytes:
+        """Encrypt a single chunk using CTR mode."""
         pass
     
     @abstractmethod
-    def decrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int, is_last: bool = False) -> bytes:
-        """Decrypt a single chunk."""
+    def decrypt_chunk(self, chunk: bytes, nonce: bytes, chunk_index: int) -> bytes:
+        """Decrypt a single chunk using CTR mode."""
         pass
     
-    def _get_chunk_iv(self, base_iv: bytes, chunk_index: int) -> bytes:
-        """Generate unique IV for each chunk based on chunk index."""
-        # XOR the base IV with chunk index to ensure unique IVs
-        iv_int = int.from_bytes(base_iv, 'big')
-        iv_int ^= chunk_index
-        return iv_int.to_bytes(len(base_iv), 'big')
+    def _calculate_counter_start(self, chunk_index: int, chunk_size: int) -> int:
+        """Calculate the starting counter value for a chunk."""
+        # Each chunk starts at a different counter position
+        # This ensures unique keystream for each chunk
+        blocks_per_chunk = (chunk_size + self.block_size - 1) // self.block_size
+        return chunk_index * blocks_per_chunk
 
 
 class AESCipher(CipherBase):
-    """AES cipher implementation."""
+    """AES cipher implementation using CTR mode."""
     
     def get_block_size(self) -> int:
         return AES_BLOCK_SIZE
     
-    def encrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int) -> bytes:
-        """Encrypt chunk using AES-CBC."""
-        chunk_iv = self._get_chunk_iv(iv, chunk_index)
-        cipher = AES.new(self.key, AES.MODE_CBC, chunk_iv)
-        padded_chunk = pad(chunk, self.block_size)
-        return cipher.encrypt(padded_chunk)
+    def encrypt_chunk(self, chunk: bytes, nonce: bytes, chunk_index: int) -> bytes:
+        """Encrypt chunk using AES-CTR."""
+        # Calculate starting counter for this chunk
+        counter_start = self._calculate_counter_start(chunk_index, len(chunk))
+        
+        # Create counter object with nonce + counter
+        # Nonce is 8 bytes, counter is 8 bytes = 16 bytes total
+        counter_bytes = nonce + counter_start.to_bytes(8, 'big')
+        counter = Counter.new(128, initial_value=int.from_bytes(counter_bytes, 'big'))
+        
+        cipher = AES.new(self.key, AES.MODE_CTR, counter=counter)
+        return cipher.encrypt(chunk)
     
-    def decrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int, is_last: bool = False) -> bytes:
-        """Decrypt chunk using AES-CBC."""
-        chunk_iv = self._get_chunk_iv(iv, chunk_index)
-        cipher = AES.new(self.key, AES.MODE_CBC, chunk_iv)
-        padded_plaintext = cipher.decrypt(chunk)
-        if is_last:
-            return unpad(padded_plaintext, self.block_size)
-        return padded_plaintext
+    def decrypt_chunk(self, chunk: bytes, nonce: bytes, chunk_index: int) -> bytes:
+        """Decrypt chunk using AES-CTR."""
+        # CTR mode: decryption is identical to encryption
+        return self.encrypt_chunk(chunk, nonce, chunk_index)
+
 
 class RC6Cipher:
     """Pure Python implementation of RC6 cipher"""
@@ -306,76 +305,50 @@ class RC6Cipher:
             D.to_bytes(4, 'little')
         )
 
-class RC6CipherCBC(CipherBase):
-    """RC6 implementation with CBC mode support"""
+
+class RC6CipherCTR(CipherBase):
+    """RC6 implementation with CTR mode support"""
     
     def __init__(self, key: bytes):
-        # Initialize the base class
         self.key = key
         self.block_size = RC6_BLOCK_SIZE
-        
-        # Create the RC6 cipher instance
         self.rc6 = RC6Cipher(key)
     
     def get_block_size(self) -> int:
         return RC6_BLOCK_SIZE
     
-    def _get_chunk_iv(self, base_iv: bytes, chunk_index: int) -> bytes:
-        """Generate unique IV for each chunk based on chunk index."""
-        # XOR the base IV with chunk index to ensure unique IVs
-        iv_int = int.from_bytes(base_iv, 'big')
-        iv_int ^= chunk_index
-        return iv_int.to_bytes(len(base_iv), 'big')
+    def _generate_keystream(self, nonce: bytes, counter_start: int, length: int) -> bytes:
+        """Generate keystream for CTR mode using RC6"""
+        keystream = b''
+        counter = counter_start
+        
+        while len(keystream) < length:
+            # Create counter block: nonce (8 bytes) + counter (8 bytes)
+            counter_block = nonce + counter.to_bytes(8, 'big')
+            
+            # Encrypt counter block to generate keystream
+            encrypted_counter = self.rc6.encrypt_block(counter_block)
+            keystream += encrypted_counter
+            counter += 1
+        
+        # Return exactly the required length
+        return keystream[:length]
     
-    def _xor_bytes(self, a: bytes, b: bytes) -> bytes:
-        """XOR two byte arrays of equal length"""
-        return bytes(x ^ y for x, y in zip(a, b))
+    def _xor_bytes(self, data: bytes, keystream: bytes) -> bytes:
+        """XOR data with keystream"""
+        return bytes(a ^ b for a, b in zip(data, keystream))
     
-    def _cbc_encrypt(self, data: bytes, iv: bytes) -> bytes:
-        """CBC mode encryption using native RC6"""
-        padded_data = pad(data, self.block_size)
-        blocks = [padded_data[i:i+self.block_size] 
-                 for i in range(0, len(padded_data), self.block_size)]
-        
-        ciphertext = b''
-        prev_block = iv
-        
-        for block in blocks:
-            xored = self._xor_bytes(block, prev_block)
-            encrypted = self.rc6.encrypt_block(xored)
-            ciphertext += encrypted
-            prev_block = encrypted
-        
-        return ciphertext
+    def encrypt_chunk(self, chunk: bytes, nonce: bytes, chunk_index: int) -> bytes:
+        """Encrypt chunk using RC6-CTR"""
+        counter_start = self._calculate_counter_start(chunk_index, len(chunk))
+        keystream = self._generate_keystream(nonce, counter_start, len(chunk))
+        return self._xor_bytes(chunk, keystream)
     
-    def _cbc_decrypt(self, data: bytes, iv: bytes) -> bytes:
-        """CBC mode decryption using native RC6"""
-        blocks = [data[i:i+self.block_size] 
-                 for i in range(0, len(data), self.block_size)]
-        
-        plaintext = b''
-        prev_block = iv
-        
-        for block in blocks:
-            decrypted = self.rc6.decrypt_block(block)
-            xored = self._xor_bytes(decrypted, prev_block)
-            plaintext += xored
-            prev_block = block
-        
-        return plaintext
-    
-    def encrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int) -> bytes:
-        """Encrypt chunk using RC6-CBC"""
-        chunk_iv = self._get_chunk_iv(iv, chunk_index)
-        return self._cbc_encrypt(chunk, chunk_iv)
-    
-    def decrypt_chunk(self, chunk: bytes, iv: bytes, chunk_index: int, is_last: bool = False) -> bytes:
-        """Decrypt chunk using RC6-CBC"""
-        chunk_iv = self._get_chunk_iv(iv, chunk_index)
-        plaintext = self._cbc_decrypt(chunk, chunk_iv)
-        if is_last:
-            return unpad(plaintext, self.block_size)
-        return plaintext
+    def decrypt_chunk(self, chunk: bytes, nonce: bytes, chunk_index: int) -> bytes:
+        """Decrypt chunk using RC6-CTR (same as encrypt in CTR mode)"""
+        return self.encrypt_chunk(chunk, nonce, chunk_index)
+
+
 class CipherFactory:
     """Factory class for creating cipher instances."""
     
@@ -385,7 +358,7 @@ class CipherFactory:
         if algorithm == 'aes':
             return AESCipher(key)
         elif algorithm == 'rc6':
-            return RC6CipherCBC(key)
+            return RC6CipherCTR(key)
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
 
@@ -400,10 +373,10 @@ class FileEncryptor:
     def encrypt_file(self, input_path: Path, algorithm: str, 
                     key: Optional[bytes] = None, 
                     password: Optional[str] = None) -> Tuple[Path, str]:
-        """Encrypt a file with segmentation support."""
+        """Encrypt a file with segmentation support using CTR mode."""
         # Prepare encryption parameters
         salt = get_random_bytes(SALT_SIZE) if password else b'\x00' * SALT_SIZE
-        iv = get_random_bytes(AES_BLOCK_SIZE)
+        nonce = get_random_bytes(NONCE_SIZE)  # 8-byte nonce for CTR mode
         
         # Handle key
         if password:
@@ -427,14 +400,14 @@ class FileEncryptor:
         metadata = EncryptionMetadata(
             algorithm=algorithm,
             salt=salt,
-            iv=iv,
+            nonce=nonce,
             original_size=file_size,
             chunk_count=chunk_count
         )
         
         # Encrypt file
         with open(output_path, 'wb') as out_file:
-            # Write metadata
+            # Write metadata (now 37 bytes instead of 45)
             out_file.write(metadata.to_bytes())
             
             # Encrypt and write chunks
@@ -443,23 +416,23 @@ class FileEncryptor:
                 # Show progress for large files
                 if total_chunks > 10 and chunk_index % 10 == 0:
                     progress = (chunk_index / total_chunks) * 100
-                    print(f"  Encrypting... {progress:.1f}%", end='\r')
+                    print(f" Encrypting... {progress:.1f}%", end='\r')
                 
-                encrypted_chunk = cipher.encrypt_chunk(chunk, iv, chunk_index)
+                encrypted_chunk = cipher.encrypt_chunk(chunk, nonce, chunk_index)
                 out_file.write(encrypted_chunk)
             
             if total_chunks > 10:
-                print("  Encrypting... 100.0%")
+                print(" Encrypting... 100.0%")
         
         return output_path, key_info
     
     def decrypt_file(self, input_path: Path, algorithm: str,
                     key: Optional[bytes] = None,
                     password: Optional[str] = None) -> Path:
-        """Decrypt a file with segmentation support."""
+        """Decrypt a file with segmentation support using CTR mode."""
         with open(input_path, 'rb') as in_file:
-            # Read metadata
-            metadata_bytes = in_file.read(45)  # Size of serialized metadata
+            # Read metadata (37 bytes for CTR mode)
+            metadata_bytes = in_file.read(37)
             metadata = EncryptionMetadata.from_bytes(metadata_bytes)
             
             # Verify algorithm matches
@@ -491,40 +464,31 @@ class FileEncryptor:
                     # Show progress for large files
                     if metadata.chunk_count > 10 and chunk_index % 10 == 0:
                         progress = (chunk_index / metadata.chunk_count) * 100
-                        print(f"  Decrypting... {progress:.1f}%", end='\r')
+                        print(f" Decrypting... {progress:.1f}%", end='\r')
                     
-                    # Calculate chunk size based on whether it's the last chunk
+                    # Calculate chunk size for reading
                     is_last_chunk = chunk_index == metadata.chunk_count - 1
                     
                     if is_last_chunk:
+                        # Read remaining bytes (no padding needed in CTR mode)
                         remaining_bytes = metadata.original_size - bytes_written
-                        # Calculate padded size for last chunk
-                        padded_size = ((remaining_bytes + cipher.block_size - 1) 
-                                     // cipher.block_size) * cipher.block_size
-                        chunk = in_file.read(padded_size)
+                        chunk = in_file.read(remaining_bytes)
                     else:
-                        # Regular chunk size (padded)
-                        padded_chunk_size = ((self.file_handler.chunk_size + cipher.block_size - 1) 
-                                           // cipher.block_size) * cipher.block_size
-                        chunk = in_file.read(padded_chunk_size)
+                        # Read full chunk
+                        chunk = in_file.read(self.file_handler.chunk_size)
                     
                     if not chunk:
                         break
                     
-                    # Decrypt chunk
-                    decrypted_chunk = cipher.decrypt_chunk(chunk, metadata.iv, chunk_index, is_last_chunk)
-                    
-                    # Handle last chunk to ensure correct file size
-                    if is_last_chunk:
-                        bytes_to_write = metadata.original_size - bytes_written
-                        decrypted_chunk = decrypted_chunk[:bytes_to_write]
+                    # Decrypt chunk (CTR mode doesn't need padding handling)
+                    decrypted_chunk = cipher.decrypt_chunk(chunk, metadata.nonce, chunk_index)
                     
                     out_file.write(decrypted_chunk)
                     bytes_written += len(decrypted_chunk)
                     chunk_index += 1
                 
                 if metadata.chunk_count > 10:
-                    print("  Decrypting... 100.0%")
+                    print(" Decrypting... 100.0%")
         
         return output_path
     
@@ -533,13 +497,18 @@ class FileEncryptor:
         suffix = '.enc' if operation == 'encrypt' else '.dec'
         stem = input_path.stem
         
-        # Remove .enc suffix when decrypting
-        if operation == 'decrypt' and stem.endswith('.enc'):
-            stem = stem[:-4]
+        # Remove existing encryption suffixes when decrypting
+        if operation == 'decrypt':
+            # Remove .enc suffix if present
+            if stem.endswith('.enc'):
+                stem = stem[:-4]
+            # Remove algorithm suffix if present (e.g., _aes, _rc6)
+            for algo in ['_aes', '_rc6']:
+                if stem.endswith(algo):
+                    stem = stem[:-4]
+                    break
         
         return input_path.parent / f"{stem}_{algorithm}{suffix}{input_path.suffix}"
-
-
 class CLIHandler:
     """Handles command-line interface."""
     
@@ -547,24 +516,24 @@ class CLIHandler:
     def create_parser() -> argparse.ArgumentParser:
         """Create command line argument parser."""
         parser = argparse.ArgumentParser(
-            description="Client-side file encryption tool with large file support",
+            description="Client-side file encryption tool with large file support (CTR mode)",
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Examples:
-  # Encrypt with auto-generated key
-  %(prog)s encrypt -a aes largefile.zip
-  
-  # Encrypt with password
-  %(prog)s encrypt -a rc6 -p "my secret password" video.mp4
-  
-  # Encrypt with specific key
-  %(prog)s encrypt -a aes -k "base64_encoded_key" document.pdf
-  
-  # Decrypt with key
-  %(prog)s decrypt -a aes -k "base64_encoded_key" document_aes.enc.pdf
-  
-  # Decrypt with password
-  %(prog)s decrypt -a rc6 -p "my secret password" video_rc6.enc.mp4
+ # Encrypt with auto-generated key
+ %(prog)s encrypt -a aes largefile.zip
+ 
+ # Encrypt with password
+ %(prog)s encrypt -a rc6 -p "my secret password" video.mp4
+ 
+ # Encrypt with specific key
+ %(prog)s encrypt -a aes -k "base64_encoded_key" document.pdf
+ 
+ # Decrypt with key
+ %(prog)s decrypt -a aes -k "base64_encoded_key" document_aes.enc.pdf
+ 
+ # Decrypt with password
+ %(prog)s decrypt -a rc6 -p "my secret password" video_rc6.enc.mp4
 """
         )
         
@@ -589,9 +558,6 @@ Examples:
         """Validate command line arguments."""
         if not args.file.exists():
             raise FileNotFoundError(f"File '{args.file}' not found")
-        
-        if args.algorithm == 'rc6' and not RC6_AVAILABLE:
-            raise RuntimeError("RC6Encryption not available. Please install: pip install RC6Encryption")
         
         if args.operation == 'decrypt' and not args.key and not args.password:
             raise ValueError("Decryption requires either --key or --password")
@@ -646,7 +612,7 @@ class Application:
                 print(f"✓ File decrypted successfully: {output_path}")
         
         except KeyboardInterrupt:
-            print("\n⚠️  Operation cancelled by user")
+            print("\n⚠️ Operation cancelled by user")
             sys.exit(1)
         except Exception as e:
             print(f"❌ Error: {str(e)}", file=sys.stderr)
